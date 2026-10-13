@@ -1,6 +1,5 @@
 import moment from "moment-timezone";
 import crypto from "crypto";
-import { execFileSync } from "child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
@@ -99,44 +98,57 @@ function getAuthHeaders(uniqueId, accessToken) {
    };
 }
 
+/**
+ * POST JSON ke `${BASE_URL}${path}` memakai fetch native.
+ *
+ * Menggantikan execFileSync('curl', ...) agar kredensial (email/password/OTP)
+ * TIDAK pernah muncul di command line — jadi tidak bocor lewat process list
+ * (`ps`/`/proc`) dan tidak bisa dibajak lewat PATH (curl palsu).
+ *
+ * @param {string} path   - Path API, mis. '/goid/token'.
+ * @param {object} body   - Objek JSON yang akan di-serialize.
+ * @param {object} headers- Header HTTP.
+ * @returns {Promise<{ status: number, data: any }>}
+ */
+async function postJson(path, body, headers) {
+   const response = await fetch(`${BASE_URL}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body)
+   });
+
+   const text = await response.text();
+   let data;
+   try {
+      data = JSON.parse(text);
+   } catch {
+      throw new Error(`Respons tidak valid dari ${path} (HTTP ${response.status})`);
+   }
+   return { status: response.status, data };
+}
+
 async function loginWithPassword(email, password) {
    const uniqueId = generateUUID();
    const headers = getAuthHeaders(uniqueId);
 
    console.log(`[Auth] Memvalidasi email: ${email}`);
-   const curlArgsRequest = ['-4', '-s', '-X', 'POST', `${BASE_URL}/goid/login/request`];
-   Object.entries(headers).forEach(([k, v]) => curlArgsRequest.push('-H', `${k}: ${v}`));
-   curlArgsRequest.push('--data-raw', JSON.stringify({ email, login_type: 'password', client_id: CLIENT_ID }));
+   const { data: valData } = await postJson('/goid/login/request', {
+      email,
+      login_type: 'password',
+      client_id: CLIENT_ID
+   }, headers);
 
-   let outputRequest;
-   try {
-      outputRequest = execFileSync('curl', curlArgsRequest, { encoding: 'utf-8' });
-   } catch (e) {
-      throw new Error(`Curl validasi email gagal: ${e.message}`);
-   }
-
-   const valData = JSON.parse(outputRequest);
    if (valData.errors?.length > 0) {
       console.warn(`[Auth] Peringatan validasi email: ${valData.errors[0].message}`);
    }
 
    console.log('[Auth] Mengirim kredensial login...');
-   const curlArgsToken = ['-4', '-s', '-X', 'POST', `${BASE_URL}/goid/token`];
-   Object.entries(headers).forEach(([k, v]) => curlArgsToken.push('-H', `${k}: ${v}`));
-   curlArgsToken.push('--data-raw', JSON.stringify({
+   const { data: tokenData } = await postJson('/goid/token', {
       client_id: CLIENT_ID,
       grant_type: 'password',
       data: { email, password }
-   }));
+   }, headers);
 
-   let outputToken;
-   try {
-      outputToken = execFileSync('curl', curlArgsToken, { encoding: 'utf-8' });
-   } catch (e) {
-      throw new Error(`Curl login gagal: ${e.message}`);
-   }
-
-   const tokenData = JSON.parse(outputToken);
    if (tokenData.errors?.length > 0) {
       throw new Error(`Login gagal: ${tokenData.errors[0].message || 'Password salah atau akun bermasalah'}`);
    }
@@ -171,23 +183,13 @@ async function loginWithOtp(phoneNumber, getOtpFn = null) {
    console.log(`[Auth] Mengirim OTP ke nomor: +62${normalizedPhone}`);
 
    // Step 1: Request OTP
-   const curlArgsRequest = ['-4', '-s', '-X', 'POST', `${BASE_URL}/goid/login/request`];
-   Object.entries(headers).forEach(([k, v]) => curlArgsRequest.push('-H', `${k}: ${v}`));
-   curlArgsRequest.push('--data-raw', JSON.stringify({
+   const { data: reqData } = await postJson('/goid/login/request', {
       client_id: CLIENT_ID,
       phone_number: normalizedPhone,
       country_code: '62',
       login_type: 'otp'
-   }));
+   }, headers);
 
-   let outputRequest;
-   try {
-      outputRequest = execFileSync('curl', curlArgsRequest, { encoding: 'utf-8' });
-   } catch (e) {
-      throw new Error(`Curl request OTP gagal: ${e.message}`);
-   }
-
-   const reqData = JSON.parse(outputRequest);
    if (reqData.errors?.length > 0) {
       throw new Error(`Request OTP gagal: ${reqData.errors[0].message}`);
    }
@@ -223,25 +225,15 @@ async function loginWithOtp(phoneNumber, getOtpFn = null) {
    console.log('[Auth] Memvalidasi kode OTP...');
 
    // Step 3: Tukar OTP dengan access token
-   const curlArgsToken = ['-4', '-s', '-X', 'POST', `${BASE_URL}/goid/token`];
-   Object.entries(headers).forEach(([k, v]) => curlArgsToken.push('-H', `${k}: ${v}`));
-   curlArgsToken.push('--data-raw', JSON.stringify({
+   const { data: tokenData } = await postJson('/goid/token', {
       client_id: CLIENT_ID,
       grant_type: 'otp',
       data: {
          otp: otpCode,
          ...(otpToken ? { otp_token: otpToken } : { phone_number: normalizedPhone })
       }
-   }));
+   }, headers);
 
-   let outputToken;
-   try {
-      outputToken = execFileSync('curl', curlArgsToken, { encoding: 'utf-8' });
-   } catch (e) {
-      throw new Error(`Curl validasi OTP gagal: ${e.message}`);
-   }
-
-   const tokenData = JSON.parse(outputToken);
    if (tokenData.errors?.length > 0) {
       throw new Error(`Login OTP gagal: ${tokenData.errors[0].message || 'Kode OTP salah atau sudah kadaluarsa'}`);
    }
@@ -637,8 +629,20 @@ export class GoPayWatcher extends EventEmitter {
       this._timer     = null;
       this._seenIds   = new Set();
       this._seeded    = false;
-      this._listeners = 0;
       this._polling   = false;
+
+      // On-demand: poller hanya hidup saat ada listener 'payment' aktif, jadi
+      // idle = 0 request. Berlaku untuk waitForPayment() maupun .on('payment').
+      this.on('newListener', (event) => {
+         if (event === 'payment' && this.listenerCount('payment') === 0) {
+            this._startPoller();
+         }
+      });
+      this.on('removeListener', (event) => {
+         if (event === 'payment' && this.listenerCount('payment') === 0) {
+            this._stopPoller();
+         }
+      });
    }
 
    _startPoller() {
@@ -656,12 +660,14 @@ export class GoPayWatcher extends EventEmitter {
    }
 
    async _poll() {
-      if (this._polling) return;
+      if (this._polling) return [];
+
       this._polling = true;
+      const emitted = [];
 
       try {
          const result = await this._merchant.getHistory({ days: 1, size: 30 });
-         if (!result?.status || !Array.isArray(result?.data?.histories)) return;
+         if (!result?.status || !Array.isArray(result?.data?.histories)) return emitted;
 
          for (const entry of result.data.histories) {
             const raw  = entry.raw || {};
@@ -681,7 +687,9 @@ export class GoPayWatcher extends EventEmitter {
                            : parseFloat(String(rawAmount ?? 0));
 
             console.log(`[GoPayWatcher] 💸 Transaksi baru: Rp ${amount.toLocaleString('id-ID')} | ID: ${txId}`);
-            this.emit('payment', { amount, txId, entry });
+            const payload = { amount, txId, entry };
+            emitted.push(payload);
+            this.emit('payment', payload);
          }
 
          if (!this._seeded) {
@@ -698,6 +706,20 @@ export class GoPayWatcher extends EventEmitter {
       } finally {
          this._polling = false;
       }
+
+      return emitted;
+   }
+
+   /**
+    * Jalankan SATU kali polling manual (tanpa menyalakan interval).
+    *
+    * Berguna saat pemanggil ingin mengatur strateginya sendiri — interval
+    * longgar saat idle dan lebih rapat saat menunggu pembayaran — tanpa harus
+    * memasang listener. Transaksi baru tetap di-emit lewat event 'payment'.
+    * @returns {Promise<Array<{ amount: number, txId: string, entry: object }>>}
+    */
+   async poll_once() {
+      return this._poll();
    }
 
    /**
@@ -710,9 +732,6 @@ export class GoPayWatcher extends EventEmitter {
     */
    waitForPayment(amount, { timeout = 5 * 60_000, tolerance = 0 } = {}) {
       return new Promise((resolve, reject) => {
-         this._listeners++;
-         this._startPoller();
-
          let timeoutHandle;
 
          const onPayment = (data) => {
@@ -724,9 +743,8 @@ export class GoPayWatcher extends EventEmitter {
 
          const cleanup = () => {
             clearTimeout(timeoutHandle);
+            // Menghapus listener terakhir otomatis mematikan poller (on-demand).
             this.off('payment', onPayment);
-            this._listeners = Math.max(0, this._listeners - 1);
-            if (this._listeners === 0) this._stopPoller();
          };
 
          timeoutHandle = setTimeout(() => {
@@ -736,6 +754,7 @@ export class GoPayWatcher extends EventEmitter {
             ));
          }, timeout);
 
+         // Menambah listener 'payment' otomatis menyalakan poller (lihat constructor).
          this.on('payment', onPayment);
       });
    }

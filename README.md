@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/JavaScript-f7df1e?logo=javascript&logoColor=black" alt="JavaScript" />
   <img src="https://img.shields.io/badge/ES_Modules-4B32C3?logo=javascript&logoColor=white" alt="ES Modules" />
   <img src="https://img.shields.io/badge/API-GoBiz%20Merchant-00AED9?logoColor=white" alt="GoBiz API" />
-  <img src="https://img.shields.io/badge/requires-curl-073551?logo=curl&logoColor=white" alt="curl" />
+  <img src="https://img.shields.io/badge/login-native_fetch-3c873a?logo=nodedotjs&logoColor=white" alt="native fetch" />
 
 </p>
 
@@ -337,8 +337,11 @@ Kelas pemantau pembayaran berbasis `EventEmitter`.
 |---------------------------------|---------------------------------------------------------------------|
 | `constructor(merchant, intervalMs?)` | `merchant` adalah instance `GoPayMerchant`, `intervalMs` default `6000` ms |
 | `waitForPayment(amount, opts?)`  | Tunggu pembayaran nominal tertentu, returns `Promise`               |
-| `on('payment', callback)`        | Dengarkan event pembayaran masuk                                    |
+| `poll_once()`                    | Jalankan **satu** kali polling manual; returns `Promise<Array>` transaksi baru |
+| `on('payment', callback)`        | Dengarkan event pembayaran masuk (otomatis menyalakan poller)       |
 | `reset()`                        | Reset seed (hapus semua ID transaksi yang diingat)                  |
+
+> **On-demand:** poller hanya berjalan saat ada listener `'payment'` aktif (baik lewat `waitForPayment()` maupun `watcher.on('payment', ...)`). Saat tidak ada listener, **idle calls = 0** — jauh lebih hemat dan mengurangi risiko rate-limit/banned.
 
 **Event `'payment'`** memancarkan objek:
 
@@ -401,7 +404,7 @@ flowchart TD
 ## Catatan Penting
 
 - Modul ini **bukan** library resmi Gojek/GoPay dan mengakses API internal GoBiz
-- Modul ini menggunakan `execFileSync('curl', ...)` untuk proses login — pastikan `curl` tersedia di sistem
+- Login memakai `fetch` native Node (tanpa `curl`) — kredensial tidak pernah tampil di command line, jadi aman dari kebocoran lewat process list & PATH hijack
 - Email & password dibaca dari file `.env` di direktori yang sama dengan `gobiz.js`
 - Token & merchant ID disimpan ke `.gopay_cache.json` yang **dibuat otomatis** — tidak perlu konfigurasi tambahan
 - Token yang kadaluarsa akan di-refresh otomatis saat request gagal dengan status `401`
